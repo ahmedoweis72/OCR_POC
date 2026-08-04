@@ -1,220 +1,355 @@
-import requests
-import base64
-import os
 import json
-from typing import Optional, Union
+
+import shutil
+
+import subprocess
+
+import tempfile
+import time
+
+from dataclasses import dataclass, asdict
+
 from pathlib import Path
 
+from typing import List, Optional
 
-def document_ocr(
-        query: Union[str, Path, bytes],
-        *,
-        model: str = "deepseek-v4-pro",  # Keep your model
-        base_url: str = "https://5o0iqnpt4j1zst-11434.proxy.runpod.net/",  # Your RunPod URL
-        timeout_s: float = 120.0,
-) -> Optional[str]:
-    """
-    Perform OCR on PDF/document using DeepSeek on RunPod.
+import fitz  # pip install pymupdf
 
-    Args:
-        query: Text query, PDF file path, or PDF bytes
-        model: DeepSeek model name
-        base_url: Your RunPod endpoint
-        timeout_s: Timeout in seconds
+from ollama import Client  # pip install ollama
 
-    Returns:
-        Extracted text or None on failure
-    """
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-    # Convert input to base64 if it's a file
-    content = None
-    is_document = False
+SUPPORTED_DOC_EXTS = {".pdf", ".docx", *SUPPORTED_IMAGE_EXTS}
 
-    if isinstance(query, (str, Path)):
-        path = Path(query)
-        if path.exists() and path.is_file():
-            # Check if it's a PDF or image
-            if path.suffix.lower() in ['.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
-                with open(path, "rb") as f:
-                    file_bytes = f.read()
-                    content = base64.b64encode(file_bytes).decode("utf-8")
-                    is_document = True
-            else:
-                # Treat as text query
-                content = query.strip()
-        else:
-            # Treat as text query
-            content = str(query).strip()
-    elif isinstance(query, bytes):
-        # Treat as document bytes
-        content = base64.b64encode(query).decode("utf-8")
-        is_document = True
-    else:
-        content = str(query).strip()
 
-    # Prepare the request for RunPod
-    url = f"{base_url.rstrip('/')}/api/chat"
+@dataclass
+class OCRPageResult:
+    source_file: str
 
-    # Build the prompt for OCR
-    if is_document:
-        # For document OCR, use the image/document in the prompt
-        system_prompt = (
-            "You are an OCR assistant. Extract ALL text from the provided document. "
-            "Preserve formatting, paragraphs, and structure. "
-            "Output ONLY the extracted text, no explanations or labels."
-        )
-        user_content = f"Extract all text from this document. Document data: {content[:100]}..."  # Truncate for display
+    page_number: int
 
-        # For RunPod with vision models, you might need to use the image URL format
-        # Since this is a chat endpoint, we'll use the base64 image format
-        user_content = {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:application/pdf;base64,{content}"
-            }
-        }
-        # For text models without vision, send as text with document marker
-        # user_content = f"[DOCUMENT_START]\n{content}\n[DOCUMENT_END]\nExtract all text from this document."
-    else:
-        # Text query - translation as before
-        system_prompt = (
-            "Translate the user text to English for document search. "
-            "Output ONLY the English translation on one line — no labels or quotes."
-        )
-        user_content = content
+    image_path: str
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt,
+    markdown: str
+
+
+class DeepSeekOCRProcessor:
+
+    def __init__(
+
+            self,
+
+            client: Client,
+
+            model: str = "deepseek-ocr:3b",
+
+            prompt: str = "<|grounding|>Convert the document to markdown.",
+
+            num_predict: int = 4096,
+
+            dpi: int = 220,
+
+            temp_dir: Optional[str] = None,
+
+    ):
+
+        self.client = client
+
+        self.model = model
+
+        self.prompt = prompt
+
+        self.num_predict = num_predict
+
+        self.dpi = dpi
+
+        self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.mkdtemp(prefix="deepseek_ocr_"))
+
+    def ensure_dependencies(self):
+
+        if shutil.which("soffice") is None and shutil.which("libreoffice") is None:
+            print("Warning: LibreOffice is not installed. DOCX files will not work.")
+
+        if shutil.which("ollama") is None:
+            print("Warning: Ollama CLI not found in PATH. Make sure Ollama server is running.")
+
+    def process(self, input_path: str, output_dir: str) -> List[OCRPageResult]:
+
+        input_file = Path(input_path).expanduser().resolve()
+
+        output_path = Path(output_dir).expanduser().resolve()
+
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if not input_file.exists():
+            raise FileNotFoundError(f"Input file not found: {input_file}")
+
+        ext = input_file.suffix.lower()
+
+        if ext not in SUPPORTED_DOC_EXTS:
+            raise ValueError(f"Unsupported file type: {ext}")
+
+        page_images = self._prepare_images(input_file)
+
+        results: List[OCRPageResult] = []
+
+        for idx, image_path in enumerate(page_images, start=1):
+            markdown = self._ocr_image(image_path)
+
+            markdown = self._postprocess_markdown(markdown)
+
+            results.append(
+
+                OCRPageResult(
+
+                    source_file=str(input_file),
+
+                    page_number=idx,
+
+                    image_path=str(image_path),
+
+                    markdown=markdown,
+
+                )
+
+            )
+
+        self._write_outputs(results, output_path, input_file.stem)
+
+        return results
+
+    def _prepare_images(self, input_file: Path) -> List[Path]:
+
+        ext = input_file.suffix.lower()
+
+        if ext in SUPPORTED_IMAGE_EXTS:
+            return [input_file]
+
+        if ext == ".pdf":
+            return self._pdf_to_images(input_file)
+
+        if ext == ".docx":
+            pdf_path = self._docx_to_pdf(input_file)
+
+            return self._pdf_to_images(pdf_path)
+
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    def _docx_to_pdf(self, docx_path: Path) -> Path:
+
+        out_dir = self.temp_dir / "docx_pdf"
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        soffice_cmd = shutil.which("soffice") or shutil.which("libreoffice")
+
+        if not soffice_cmd:
+            raise RuntimeError(
+
+                "LibreOffice is required for DOCX support.\n"
+
+                "Ubuntu/Debian: sudo apt-get install -y libreoffice"
+
+            )
+
+        cmd = [
+
+            soffice_cmd,
+
+            "--headless",
+
+            "--convert-to",
+
+            "pdf",
+
+            "--outdir",
+
+            str(out_dir),
+
+            str(docx_path),
+
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+
+                f"DOCX to PDF conversion failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+
+            )
+
+        pdf_path = out_dir / f"{docx_path.stem}.pdf"
+
+        if not pdf_path.exists():
+            raise RuntimeError(f"Converted PDF not found: {pdf_path}")
+
+        return pdf_path
+
+    def _pdf_to_images(self, pdf_path: Path) -> List[Path]:
+
+        images_dir = self.temp_dir / f"{pdf_path.stem}_pages"
+
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        doc = fitz.open(pdf_path)
+
+        image_paths = []
+
+        zoom = self.dpi / 72.0
+
+        matrix = fitz.Matrix(zoom, zoom)
+
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+            img_path = images_dir / f"page_{i + 1:04d}.png"
+
+            pix.save(str(img_path))
+
+            image_paths.append(img_path)
+
+        doc.close()
+
+        return image_paths
+
+    def _ocr_image(self, image_path: Path) -> str:
+
+        response = self.client.chat(
+
+            model=self.model,
+
+            messages=[
+
+                {
+
+                    "role": "user",
+
+                    "content": self.prompt,
+
+                    "images": [str(image_path)],
+
+                }
+
+            ],
+
+            options={
+
+                "num_predict": self.num_predict,
+
             },
-            {
-                "role": "user",
-                "content": user_content
-            },
-        ],
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0, "num_predict": 4096},  # Increased for longer OCR output
-    }
 
-    try:
-        resp = requests.post(url, json=payload, timeout=timeout_s)
-        resp.raise_for_status()
+        )
 
-        response_data = resp.json()
-        text = (response_data.get("message") or {}).get("content", "").strip()
+        return response["message"]["content"]
 
-        # For OCR, we want all text, not just first line
-        if is_document:
-            # Return the full extracted text
-            return text if text else None
+    def _postprocess_markdown(self, text: str) -> str:
 
-        # For translation, return first non-empty line
-        for line in text.splitlines():
-            line = line.strip().strip('"').strip("'")
-            if line:
-                return line
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-        return None
+        lines = [line.rstrip() for line in text.splitlines()]
 
-    except requests.RequestException as exc:
-        print(f"⚠️ RunPod request failed: {exc}")
-        if hasattr(exc, 'response') and exc.response:
-            try:
-                error_detail = exc.response.json()
-                print(f"Error detail: {error_detail}")
-            except:
-                print(f"Response: {exc.response.text[:200]}")
-        return None
-    except Exception as exc:
-        print(f"⚠️ Unexpected error: {exc}")
-        return None
+        cleaned = "\n".join(lines).strip()
 
+        deduped_lines = []
 
-# Specialized function for PDF OCR with DeepSeek
-def pdf_ocr(
-        pdf_path: Union[str, Path],
-        *,
-        model: str = "deepseek-v4-pro",
-        base_url: str = "https://5o0iqnpt4j1zst-11434.proxy.runpod.net/",
-        timeout_s: float = 180.0,
-        chunk_size: int = 10,  # Pages per chunk for large PDFs
-) -> Optional[str]:
-    """
-    Specialized PDF OCR function with chunking support.
-    """
-    path = Path(pdf_path)
-    if not path.exists():
-        print(f"⚠️ File not found: {pdf_path}")
-        return None
+        last = None
 
-    # For large PDFs, you might need to process in chunks
-    # This is a simplified version - you may need to use PyPDF2 or similar
-    # to split PDFs into pages
+        repeat_count = 0
 
-    try:
-        import PyPDF2
-        from io import BytesIO
+        for line in cleaned.splitlines():
 
-        with open(path, "rb") as f:
-            pdf_reader = PyPDF2.PdfReader(f)
-            total_pages = len(pdf_reader.pages)
+            if line == last:
 
-            if total_pages <= chunk_size:
-                # Small PDF, process whole file
-                return document_ocr(path, model=model, base_url=base_url, timeout_s=timeout_s)
+                repeat_count += 1
+
             else:
-                # Large PDF, process in chunks
-                all_text = []
-                for start_page in range(0, total_pages, chunk_size):
-                    end_page = min(start_page + chunk_size, total_pages)
-                    print(f"Processing pages {start_page + 1}-{end_page} of {total_pages}")
 
-                    # Create a PDF with just these pages
-                    pdf_writer = PyPDF2.PdfWriter()
-                    for page_num in range(start_page, end_page):
-                        pdf_writer.add_page(pdf_reader.pages[page_num])
+                repeat_count = 0
 
-                    pdf_bytes = BytesIO()
-                    pdf_writer.write(pdf_bytes)
+            if repeat_count < 2:
+                deduped_lines.append(line)
 
-                    # Process this chunk
-                    chunk_text = document_ocr(
-                        pdf_bytes.getvalue(),
-                        model=model,
-                        base_url=base_url,
-                        timeout_s=timeout_s
-                    )
+            last = line
 
-                    if chunk_text:
-                        all_text.append(chunk_text)
+        return "\n".join(deduped_lines).strip()
 
-                return "\n\n".join(all_text) if all_text else None
+    def _write_outputs(self, results: List[OCRPageResult], output_dir: Path, base_name: str):
 
-    except ImportError:
-        print("⚠️ PyPDF2 not installed. Install with: pip install PyPDF2")
-        # Fallback to processing whole file
-        return document_ocr(path, model=model, base_url=base_url, timeout_s=timeout_s)
-    except Exception as exc:
-        print(f"⚠️ PDF processing error: {exc}")
-        return None
+        md_path = output_dir / f"{base_name}.md"
+
+        json_path = output_dir / f"{base_name}.json"
+
+        with open(md_path, "w", encoding="utf-8") as f:
+
+            for r in results:
+
+                if len(results) > 1:
+                    f.write(f"\n\n<!-- PAGE {r.page_number} -->\n\n")
+
+                f.write(r.markdown)
+
+                f.write("\n")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+
+            json.dump([asdict(r) for r in results], f, ensure_ascii=False, indent=2)
 
 
-# Example usage
+def main():
+    ollama_url = "https://r4pl207radupn7-11434.proxy.runpod.net/"
+
+    INPUT_DIR = Path("input")
+
+    output_dir = r"./output"
+
+    model = "deepseek-ocr"
+
+    prompt = """<|grounding|>Convert the document to markdown.
+
+    Additional OCR constraints:
+    1. Primary language is Arabic. Preserve RTL alignment, diacritics, and connected letter forms exactly.
+    2. Preserve all layout elements: paragraphs, indentation, bullet points, and table structures.
+    3. Transcribe text verbatim. No summarization.
+    4. This document contains zero Chinese characters. Discard any CJK hallucinations.
+    5. Output ONLY raw markdown text."""
+
+    num_predict = 4096
+
+    dpi = 220
+
+    client = Client(host=ollama_url)
+
+    processor = DeepSeekOCRProcessor(
+
+        client=client,
+
+        model=model,
+
+        prompt=prompt,
+
+        num_predict=num_predict,
+
+        dpi=dpi,
+
+    )
+
+    processor.ensure_dependencies()
+    for file in INPUT_DIR.iterdir():
+        total_start = time.perf_counter()
+        results = processor.process(str(file), output_dir)
+        total_end = time.perf_counter()
+
+        print(f"⏱️ Total Script Execution Time: {total_end - total_start:.2f} seconds")
+
+        print(f"Processed {len(results)} page(s).")
+
+        print(f"Markdown saved to: {Path(output_dir).resolve() / (Path(file).stem + '.md')}")
+
+        print(f"JSON saved to: {Path(output_dir).resolve() / (Path(file).stem + '.json')}")
+
+
 if __name__ == "__main__":
-    # For translation (original use case)
-    translation = document_ocr(
-        "مرحبا كيف حالك",
-        base_url="https://5o0iqnpt4j1zst-11434.proxy.runpod.net/"
-    )
-    print(f"Translation: {translation}")
+    main()
 
-    # For PDF OCR
-    ocr_text = pdf_ocr(
-        "document.pdf",
-        base_url="https://5o0iqnpt4j1zst-11434.proxy.runpod.net/"
-    )
-    print(f"OCR Result: {ocr_text}")
+
