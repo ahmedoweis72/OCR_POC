@@ -59,24 +59,12 @@ PUBLAYNET_LABEL_MAP = {
 }
 
 ARABIC_OCR_PROMPT = """<|grounding|>
-Transcribe this document region to Markdown.
+convert this document region to Markdown.
 
-Rules:
-1. The main language is Arabic. Preserve Arabic Unicode characters, RTL word
-   order, diacritics, Arabic and Western numerals, and punctuation exactly as
-   printed. Do not reverse Arabic letters.
-2. Transcribe only text that is visible in this region; do not summarize,
-   translate, correct, or invent text.
-3. Preserve headings, paragraphs, lists, and tables. Use a Markdown table when
-   the region is a table.
-4. Return only the Markdown transcription, without commentary or code fences.
 """
 
 client = OpenAI(
-    base_url="https://x9p8cvseqh9k7s-11434.proxy.runpod.net/",
-    # Some OpenAI-compatible local/RunPod endpoints do not validate this
-    # value, but langchain-openai requires a non-empty string on construction.
-    # Set OCR_API_KEY when the endpoint has real authentication enabled.
+    base_url="https://x9p8cvseqh9k7s-11434.proxy.runpod.net/v1/",
     api_key=os.getenv("OCR_API_KEY", "not-needed"),
 )
 
