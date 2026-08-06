@@ -16,6 +16,8 @@ import json
 import os
 import shutil
 import tempfile
+import time
+
 import unicodedata
 from argparse import Namespace
 from pathlib import Path
@@ -25,6 +27,7 @@ from urllib.request import urlopen
 from markitdown import MarkItDown
 from openai import OpenAI
 
+from milvas import *
 
 # -------------------------------------------------------
 # Configuration
@@ -389,35 +392,50 @@ def process_office_document(path: Path) -> str:
 # -------------------------------------------------------
 
 def main() -> None:
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    print(f"OCR model: {OCR_MODEL}")
+    # OUTPUT_DIR.mkdir(exist_ok=True)
+    # print(f"OCR model: {OCR_MODEL}")
+    #
+    # for file in INPUT_DIR.iterdir():
+    #     if not file.is_file():
+    #         continue
+    #
+    #     try:
+    #         print(f"Processing {file.name}")
+    #
+    #         if file.suffix.lower() == ".pdf":
+    #             text = process_pdf(file, OUTPUT_DIR)
+    #         else:
+    #             text = process_office_document(file)
+    #
+    #         output_file = OUTPUT_DIR / f"{file.stem}.md"
+    #         output_file.write_text(normalize_arabic_text(text), encoding="utf-8")
+    #
+    #         print("✓ Done")
+    #     except Exception as exc:
+    #         print(f"✗ Failed: {file.name}")
+    #         print(exc)
+    #         if "model" in str(exc).lower() and "does not exist" in str(exc).lower():
+    #             print(
+    #                 "Stopping because the configured OCR model is unavailable. "
+    #                 "Set OCR_MODEL to the exact name exposed by your RunPod deployment."
+    #             )
+    #             break
 
-    for file in INPUT_DIR.iterdir():
-        if not file.is_file():
-            continue
-
-        try:
-            print(f"Processing {file.name}")
-
-            if file.suffix.lower() == ".pdf":
-                text = process_pdf(file, OUTPUT_DIR)
-            else:
-                text = process_office_document(file)
-
-            output_file = OUTPUT_DIR / f"{file.stem}.md"
-            output_file.write_text(normalize_arabic_text(text), encoding="utf-8")
-
-            print("✓ Done")
-        except Exception as exc:
-            print(f"✗ Failed: {file.name}")
-            print(exc)
-            if "model" in str(exc).lower() and "does not exist" in str(exc).lower():
-                print(
-                    "Stopping because the configured OCR model is unavailable. "
-                    "Set OCR_MODEL to the exact name exposed by your RunPod deployment."
-                )
-                break
-
+    from milvas import connect, disconnect, drop_collection, create_collection, list_collections, add_document
+    start_time = time.time()
+    client = connect()
+    # drop_collection(client, "semantic_jupiter_test")
+    # create_collection(client, "semantic_jupiter_test")
+    # print(list_collections(client))
+    # add_document(client, "Hello world", source="test150", collection_name="semantic_jupiter_test")
+    doc_id = "664f4e322e0aaaffa96427d8539546e3f61b67550223f480d48aa84425d9c08c"
+    # upsert_document(client, "Hello world", doc_id=doc_id, source="test", collection_name="semantic_jupiter_test")
+    # print(get_document(client, doc_id, collection_name="semantic_jupiter_test"))
+    # print(get_document_by_source(client, "test", collection_name="semantic_jupiter_test"))
+    update_document(client,doc_id,None, source="test150", collection_name="semantic_jupiter_test")
+    disconnect(client)
+    end_time = time.time()
+    print(f"Total execution time: {end_time - start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()
